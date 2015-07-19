@@ -1,0 +1,184 @@
+diff --git a/net/cookies/cookie_monster.cc b/net/cookies/cookie_monster.cc
+index d318647..a28fb4e 100644
+--- a/net/cookies/cookie_monster.cc
++++ b/net/cookies/cookie_monster.cc
+@@ -124,7 +124,7 @@ typedef std::vector<CanonicalCookie*> CanonicalCookieVector;
+ 
+ // Default minimum delay after updating a cookie's LastAccessDate before we
+ // will update it again.
+-const int kDefaultAccessUpdateThresholdSeconds = 60;
++const int kDefaultAccessUpdateThresholdMilliSeconds = 60 * 1000;
+ 
+ // Comparator to sort cookies from highest creation date to lowest
+ // creation date.
+@@ -317,22 +317,25 @@ void RunAsync(scoped_refptr<base::TaskRunner> proxy,
+ 
+ CookieMonster::CookieMonster(PersistentCookieStore* store,
+                              CookieMonsterDelegate* delegate)
+-    : initialized_(false),
+-      loaded_(store == NULL),
+-      store_(store),
+-      last_access_threshold_(
+-          TimeDelta::FromSeconds(kDefaultAccessUpdateThresholdSeconds)),
+-      delegate_(delegate),
+-      last_statistic_record_time_(Time::Now()),
+-      keep_expired_cookies_(false),
+-      persist_session_cookies_(false) {
+-  InitializeHistograms();
+-  SetDefaultCookieableSchemes();
++    : CookieMonster(store,
++                    delegate,
++                    CookiePreference(),
++                    kDefaultAccessUpdateThresholdMilliSeconds) {
+ }
+ 
+ CookieMonster::CookieMonster(PersistentCookieStore* store,
+                              CookieMonsterDelegate* delegate,
+                              int last_access_threshold_milliseconds)
++    : CookieMonster(store,
++                    delegate,
++                    CookiePreference(),
++                    last_access_threshold_milliseconds) {
++}
++
++CookieMonster::CookieMonster(PersistentCookieStore* store,
++                             CookieMonsterDelegate* delegate,
++                             const CookiePreference& preference,
++                             int last_access_threshold_milliseconds)
+     : initialized_(false),
+       loaded_(store == NULL),
+       store_(store),
+@@ -341,11 +344,21 @@ CookieMonster::CookieMonster(PersistentCookieStore* store,
+       delegate_(delegate),
+       last_statistic_record_time_(base::Time::Now()),
+       keep_expired_cookies_(false),
+-      persist_session_cookies_(false) {
++      persist_session_cookies_(false),
++      preference_(preference) {
+   InitializeHistograms();
+   SetDefaultCookieableSchemes();
+ }
+ 
++CookieMonster::CookiePreference::CookiePreference()
++    : domain_max_cookies(kDomainMaxCookies),
++      domain_purge_cookies(kDomainPurgeCookies),
++      max_cookies(kMaxCookies),
++      purge_cookies(kPurgeCookies),
++      domain_cookies_quota_low(kDomainCookiesQuotaLow),
++      domain_cookies_quota_medium(kDomainCookiesQuotaMedium),
++      domain_cookies_quota_high(kDomainCookiesQuotaHigh) {
++}
+ 
+ // Task classes for queueing the coming request.
+ 
+@@ -1925,17 +1938,17 @@ int CookieMonster::GarbageCollect(const Time& current,
+       Time::Now() - TimeDelta::FromDays(kSafeFromGlobalPurgeDays));
+ 
+   // Collect garbage for this key, minding cookie priorities.
+-  if (cookies_.count(key) > kDomainMaxCookies) {
++  if (cookies_.count(key) > preference_.domain_max_cookies) {
+     VLOG(kVlogGarbageCollection) << "GarbageCollect() key: " << key;
+ 
+     CookieItVector cookie_its;
+     num_deleted += GarbageCollectExpired(
+         current, cookies_.equal_range(key), &cookie_its);
+-    if (cookie_its.size() > kDomainMaxCookies) {
++    if (cookie_its.size() > preference_.domain_max_cookies) {
+       VLOG(kVlogGarbageCollection) << "Deep Garbage Collect domain.";
+-      size_t purge_goal =
+-          cookie_its.size() - (kDomainMaxCookies - kDomainPurgeCookies);
+-      DCHECK(purge_goal > kDomainPurgeCookies);
++      size_t purge_goal = cookie_its.size() -
++          (preference_.domain_max_cookies - preference_.domain_purge_cookies);
++      DCHECK(purge_goal > preference_.domain_purge_cookies);
+ 
+       // Boundary iterators into |cookie_its| for different priorities.
+       CookieItVector::iterator it_bdd[4];
+@@ -1948,9 +1961,9 @@ int CookieMonster::GarbageCollect(const Time& current,
+       it_bdd[2] = PartitionCookieByPriority(it_bdd[1], it_bdd[3],
+                                             COOKIE_PRIORITY_MEDIUM);
+       size_t quota[3] = {
+-        kDomainCookiesQuotaLow,
+-        kDomainCookiesQuotaMedium,
+-        kDomainCookiesQuotaHigh
++        preference_.domain_cookies_quota_low,
++        preference_.domain_cookies_quota_medium,
++        preference_.domain_cookies_quota_high
+       };
+ 
+       // Purge domain cookies in 3 rounds.
+@@ -1999,17 +2012,18 @@ int CookieMonster::GarbageCollect(const Time& current,
+ 
+   // Collect garbage for everything. With firefox style we want to preserve
+   // cookies accessed in kSafeFromGlobalPurgeDays, otherwise evict.
+-  if (cookies_.size() > kMaxCookies &&
++  if (cookies_.size() > preference_.max_cookies &&
+       earliest_access_time_ < safe_date) {
+     VLOG(kVlogGarbageCollection) << "GarbageCollect() everything";
+     CookieItVector cookie_its;
+     num_deleted += GarbageCollectExpired(
+         current, CookieMapItPair(cookies_.begin(), cookies_.end()),
+         &cookie_its);
+-    if (cookie_its.size() > kMaxCookies) {
++    if (cookie_its.size() > preference_.max_cookies) {
+       VLOG(kVlogGarbageCollection) << "Deep Garbage Collect everything.";
+-      size_t purge_goal = cookie_its.size() - (kMaxCookies - kPurgeCookies);
+-      DCHECK(purge_goal > kPurgeCookies);
++      size_t purge_goal = cookie_its.size() -
++          (preference_.max_cookies - preference_.purge_cookies);
++      DCHECK(purge_goal > preference_.purge_cookies);
+       // Sorts up to *and including* |cookie_its[purge_goal]|, so
+       // |earliest_access_time| will be properly assigned even if
+       // |global_purge_it| == |cookie_its.begin() + purge_goal|.
+diff --git a/net/cookies/cookie_monster.h b/net/cookies/cookie_monster.h
+index 0f00490..ac5c13c 100644
+--- a/net/cookies/cookie_monster.h
++++ b/net/cookies/cookie_monster.h
+@@ -37,6 +37,7 @@ class TimeTicks;
+ 
+ namespace net {
+ 
++struct CookiePreference;
+ class CookieMonsterDelegate;
+ class ParsedCookie;
+ 
+@@ -133,6 +134,18 @@ class NET_EXPORT CookieMonster : public CookieStore {
+   static const size_t kDomainCookiesQuotaMedium;
+   static const size_t kDomainCookiesQuotaHigh;
+ 
++  struct CookiePreference {
++    CookiePreference();
++
++    size_t domain_max_cookies;
++    size_t domain_purge_cookies;
++    size_t max_cookies;
++    size_t purge_cookies;
++    size_t domain_cookies_quota_low;
++    size_t domain_cookies_quota_medium;
++    size_t domain_cookies_quota_high;
++  };
++
+   // The store passed in should not have had Init() called on it yet. This
+   // class will take care of initializing it. The backing store is NOT owned by
+   // this class, but it must remain valid for the duration of the cookie
+@@ -146,6 +159,11 @@ class NET_EXPORT CookieMonster : public CookieStore {
+                 CookieMonsterDelegate* delegate,
+                 int last_access_threshold_milliseconds);
+ 
++  CookieMonster(PersistentCookieStore* store,
++                CookieMonsterDelegate* delegate,
++                const CookiePreference& preference,
++                int last_access_threshold_milliseconds);
++
+   // Helper function that adds all cookies from |list| into this instance,
+   // overwriting any equivalent cookies.
+   bool ImportCookies(const CookieList& list);
+@@ -707,6 +725,8 @@ class NET_EXPORT CookieMonster : public CookieStore {
+                    linked_ptr<CookieChangedCallbackList>> CookieChangedHookMap;
+   CookieChangedHookMap hook_map_;
+ 
++  CookiePreference preference_;
++
+   DISALLOW_COPY_AND_ASSIGN(CookieMonster);
+ };
+ 
